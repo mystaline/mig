@@ -28,12 +28,11 @@ class MigrationTool:
         self.db_config = {
             'host': getenv('DB_HOST'),
             'port': int(getenv('DB_PORT')),
-            'database': getenv('DB_DATABASE'),
             'user': getenv('DB_USERNAME'),
             'password': getenv('DB_PASSWORD')
         }
         
-        required_vars = ['DB_HOST', 'DB_PORT', 'DB_DATABASE', 'DB_USERNAME', 'DB_PASSWORD']
+        required_vars = ['DB_HOST', 'DB_PORT', 'DB_USERNAME', 'DB_PASSWORD']
         missing = [v for v in required_vars if not getenv(v)]
         if missing:
             raise EnvironmentError(f"✗ Missing environment variables: {', '.join(missing)}")
@@ -140,27 +139,29 @@ class MigrationTool:
         Create a new migration file with timestamp.
         """
         self.migrations_dir.mkdir(exist_ok=True)
+        db_migrations_dir = Path(f"{self.migrations_dir}/{self.db_config['database']}")
+        db_migrations_dir.mkdir(exist_ok=True)
         
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         safe_name = name.lower().replace(" ", "_")
         filename_up = f"{timestamp}_{safe_name}.up.sql"
         filename_down = f"{timestamp}_{safe_name}.down.sql"
 
-        path_up = self.migrations_dir/filename_up
-        path_down = self.migrations_dir/filename_down
+        path_up = db_migrations_dir/filename_up
+        path_down = db_migrations_dir/filename_down
         
         template_up = f"""-- Up Migration {name} 
 -- Created At {datetime.now().isoformat()}
         
 -- TODO: Write you up migration here
-        
-        """
+
+"""
         template_down = f"""-- Down Migration {name} 
 -- Created At {datetime.now().isoformat()}
         
 -- TODO: Write you down migration here
-        
-        """
+
+"""
         
         path_up.write_text(template_up)
         path_down.write_text(template_down)
@@ -206,6 +207,8 @@ class MigrationTool:
         """
         
         self.migrations_dir.mkdir(exist_ok=True)
+        db_migrations_dir = Path(f"{self.migrations_dir}/{self.db_config['database']}")
+        db_migrations_dir.mkdir(exist_ok=True)
         
         try:
             conn = self.connect()
@@ -224,12 +227,12 @@ class MigrationTool:
                 return
 
             # List all migrations
-            migrations = sorted(self.migrations_dir.glob("*.up.sql"))
+            migrations = sorted(db_migrations_dir.glob("*.up.sql"))
             migration_versions = [m.stem.split("_")[0] for m in migrations]
             to_run = [m for m in migrations if current_version is None or m.stem.split("_")[0] > current_version]
             
             if direction == "down":
-                migrations = sorted(self.migrations_dir.glob("*.down.sql"), reverse=True)
+                migrations = sorted(db_migrations_dir.glob("*.down.sql"), reverse=True)
                 to_run = [m for m in migrations if current_version is not None and m.stem.split("_")[0] <= current_version]
                 
             if step:
@@ -278,7 +281,7 @@ class MigrationTool:
                 self.conn.rollback()
             raise
            
-    def init(self):
+    def init(self, dbName):
         """
         Initialize the migration system:
         1. Create the database if it doesn't exist
@@ -287,16 +290,18 @@ class MigrationTool:
         """
         print("Initializing migration system...")
         
+        self.db_config['database'] = dbName
+        
         # Step 1: Create database if needed
         self.create_database()
         
         # Step 2: Create directories
         # exist_ok=True means "don't error if directory already exists"
         self.migrations_dir.mkdir(exist_ok=True)
-        print(f"  ✓ Created directory: {self.migrations_dir}")
+        print(f"  ✓ Created directory: {self.migrations_dir}/{dbName}")
         
         self.seeds_dir.mkdir(exist_ok=True)
-        print(f"  ✓ Created directory: {self.seeds_dir}")
+        print(f"  ✓ Created directory: {self.seeds_dir}/{dbName}")
         
         # Step 3: Connect to database
         try:
@@ -367,6 +372,13 @@ def main():
     )
     
     migrate_parser.add_argument(
+        'db',
+        type=str,
+        choices=['clefinport_user', 'clefinport_wallet', 'clefinport_log'],
+        help='Migration direction: up or down'
+    )
+    
+    migrate_parser.add_argument(
         '--step',
         type=int,
         default=None,
@@ -382,13 +394,13 @@ def main():
     # Route to appropriate command
     try:
         if args.command == 'init':
-            tool.init()
+            tool.init(args.db)
         elif args.command == 'test':
             tool.test_command()
         elif args.command == 'make:migration':
             tool.create_migration(args.name)
         elif args.command == 'migrate':
-            tool.init()
+            tool.init(args.db)
             tool.migrate(args.direction, args.step)
         else:
             parser.print_help()
