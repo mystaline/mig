@@ -3,14 +3,94 @@ package database
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type PostgresDB struct {
 	Pool *pgxpool.Pool
+}
+
+func (p *PostgresDB) Exec(
+	ctx context.Context,
+	query string,
+	args ...any,
+) error {
+	_, err := p.Pool.Exec(ctx, query, args...)
+	return err
+}
+
+func (p *PostgresDB) QueryRow(
+	ctx context.Context,
+	query string,
+	args ...any,
+) Row {
+	return p.Pool.QueryRow(ctx, query, args...)
+}
+
+func (p *PostgresDB) Query(
+	ctx context.Context,
+	query string,
+	args ...any,
+) (Rows, error) {
+	return p.Pool.Query(ctx, query, args...)
+}
+
+type pgxTx struct {
+	tx  pgx.Tx
+	ctx context.Context
+}
+
+func (t *pgxTx) Exec(ctx context.Context, query string, args ...any) error {
+	_, err := t.tx.Exec(ctx, query, args...)
+	return err
+}
+
+func (p *PostgresDB) ExecTx(ctx context.Context, fn func(Tx) error) error {
+	tx, err := p.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback(ctx)
+			panic(p)
+		} else if err != nil {
+			_ = tx.Rollback(ctx)
+		} else {
+			err = tx.Commit(ctx)
+		}
+	}()
+
+	err = formatPgError(fn(&pgxTx{tx: tx, ctx: ctx}))
+	return err
+}
+
+func formatPgError(err error) error {
+	if pgErr, ok := err.(*pgconn.PgError); ok {
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("PostgreSQL Error: %s\n", pgErr.Message))
+		if pgErr.Detail != "" {
+			sb.WriteString(fmt.Sprintf("Detail: %s\n", pgErr.Detail))
+		}
+		if pgErr.Hint != "" {
+			sb.WriteString(fmt.Sprintf("Hint: %s\n", pgErr.Hint))
+		}
+		if pgErr.Line > 0 {
+			sb.WriteString(fmt.Sprintf("Line: %d\n", pgErr.Line))
+		}
+		return fmt.Errorf("\n%s", sb.String())
+	}
+	return err
+}
+
+func (db *PostgresDB) Close() {
+	db.Pool.Close()
 }
 
 func NewPostgresDB(ctx context.Context, connStr string) (*PostgresDB, error) {
@@ -40,31 +120,6 @@ func NewPostgresDBFromConfig(ctx context.Context, config *pgxpool.Config) (*Post
 	}
 
 	return nil, fmt.Errorf("could not connect to database after 10 attempts: %w", err)
-}
-
-func (db *PostgresDB) Close() {
-	db.Pool.Close()
-}
-
-func (db *PostgresDB) ExecTx(ctx context.Context, fn func(pgx.Tx) error) error {
-	tx, err := db.Pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		if p := recover(); p != nil {
-			_ = tx.Rollback(ctx)
-			panic(p)
-		} else if err != nil {
-			_ = tx.Rollback(ctx)
-		} else {
-			err = tx.Commit(ctx)
-		}
-	}()
-
-	err = fn(tx)
-	return err
 }
 
 func CreateDatabase(ctx context.Context, config *pgx.ConnConfig, dbName string) error {

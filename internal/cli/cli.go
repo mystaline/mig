@@ -20,6 +20,24 @@ var (
 	dir   string
 )
 
+// openDB detects the driver from the URL scheme and returns the appropriate DB.
+// Supported schemes:
+//   - postgres:// or postgresql:// → PostgresDB
+//   - sqlite:// or sqlite3://      → SQLiteDB (path after scheme)
+//   - file path (no scheme)        → SQLiteDB
+func openDB(ctx context.Context, url string) (database.DB, error) {
+	switch {
+	case strings.HasPrefix(url, "postgres://"), strings.HasPrefix(url, "postgresql://"):
+		return database.NewPostgresDB(ctx, url)
+	case strings.HasPrefix(url, "sqlite://"):
+		return database.NewSQLiteDB(ctx, strings.TrimPrefix(url, "sqlite://"))
+	case strings.HasPrefix(url, "sqlite3://"):
+		return database.NewSQLiteDB(ctx, strings.TrimPrefix(url, "sqlite3://"))
+	default:
+		return nil, fmt.Errorf("unsupported DB_URL scheme: %q (expected postgres://, postgresql://, or sqlite://)", url)
+	}
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "mig",
 	Short: "A robust database migration tool",
@@ -30,13 +48,6 @@ var rootCmd = &cobra.Command{
 		}
 		if dbURL == "" && cmd.Name() != "create" {
 			return fmt.Errorf("DB_URL is not set. Please provide it via --db-url flag or DB_URL environment variable")
-		}
-
-		if dbURL != "" {
-			// Validate Postgres URL schema
-			if !strings.HasPrefix(dbURL, "postgres://") && !strings.HasPrefix(dbURL, "postgresql://") {
-				return fmt.Errorf("invalid DB_URL: must start with 'postgres://' or 'postgresql://'")
-			}
 		}
 
 		if dir == "" {
@@ -62,7 +73,7 @@ var initCmd = &cobra.Command{
 	Short: "Initialize the migration tracking table",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
-		db, err := database.NewPostgresDB(ctx, dbURL)
+		db, err := openDB(ctx, dbURL)
 		if err != nil {
 			return err
 		}
@@ -92,7 +103,7 @@ var upCmd = &cobra.Command{
 	Short: "Apply pending migrations",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
-		db, err := database.NewPostgresDB(ctx, dbURL)
+		db, err := openDB(ctx, dbURL)
 		if err != nil {
 			return err
 		}
@@ -108,7 +119,7 @@ var downCmd = &cobra.Command{
 	Short: "Rollback last applied migration",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
-		db, err := database.NewPostgresDB(ctx, dbURL)
+		db, err := openDB(ctx, dbURL)
 		if err != nil {
 			return err
 		}
@@ -124,7 +135,7 @@ var statusCmd = &cobra.Command{
 	Short: "Show migration status",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
-		db, err := database.NewPostgresDB(ctx, dbURL)
+		db, err := openDB(ctx, dbURL)
 		if err != nil {
 			return err
 		}
@@ -155,59 +166,35 @@ var testCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
-		// 1. Generate unique DB name
-		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-		letters := []rune("abcdefghijklmnopqrstuvwxyz")
-		b := make([]rune, 6)
-		for i := range b {
-			b[i] = letters[rng.Intn(len(letters))]
-		}
-		tempDBName := fmt.Sprintf("mig_test_%s_%s", time.Now().Format("200601021504"), string(b))
+		var (
+			db      database.DB
+			label   string
+			cleanup func()
+			err     error
+		)
 
-		// 2. Prepare base connection string (connecting to 'postgres')
-		poolConfig, err := pgxpool.ParseConfig(dbURL)
+		switch {
+		case strings.HasPrefix(dbURL, "postgres://"), strings.HasPrefix(dbURL, "postgresql://"):
+			db, label, cleanup, err = setupPostgresTestDB(ctx)
+		case strings.HasPrefix(dbURL, "sqlite://"), strings.HasPrefix(dbURL, "sqlite3://"):
+			db, label, cleanup, err = setupSQLiteTestDB(ctx)
+		default:
+			return fmt.Errorf("unsupported DB_URL scheme for test command")
+		}
 		if err != nil {
 			return err
 		}
-		originalDB := poolConfig.ConnConfig.Database
-
-		// Create admin config for create/drop
-		adminConfig := poolConfig.ConnConfig.Copy()
-		adminConfig.Database = "postgres"
-
-		fmt.Printf("==> Creating temporary test database: %s\n", tempDBName)
-		if err := database.CreateDatabase(ctx, adminConfig, tempDBName); err != nil {
-			return fmt.Errorf("failed to create test database: %w", err)
-		}
-
-		// Ensure cleanup on failure or exit
-		defer func() {
-			fmt.Printf("\n==> Cleaning up...\n")
-			fmt.Printf("==> Dropping temporary test database: %s\n", tempDBName)
-			if err := database.DropDatabase(ctx, adminConfig, tempDBName); err != nil {
-				fmt.Printf("Warning: failed to drop test database: %v\n", err)
-			}
-		}()
-
-		// 3. Connect to the new temp DB
-		testPoolConfig, _ := pgxpool.ParseConfig(dbURL)
-		testPoolConfig.ConnConfig.Database = tempDBName
-
-		db, err := database.NewPostgresDBFromConfig(ctx, testPoolConfig)
-		if err != nil {
-			return err
-		}
+		defer cleanup()
 		defer db.Close()
 
 		m := migrator.NewMigrator(db, dir)
 
-		// 4. Run up -> down -> up sequence
 		fmt.Println("==> Step 1: Initializing and running all migrations (UP)")
 		if err := m.Init(ctx); err != nil {
 			return err
 		}
 		if err := m.RunUp(ctx, 0); err != nil {
-			fmt.Println("\n[!] Test failed during Step 1. Attempting auto-repair for temporary test database (rollback)...")
+			fmt.Println("\n[!] Test failed during Step 1. Attempting auto-repair...")
 			_ = m.Repair(ctx)
 			return err
 		}
@@ -215,7 +202,7 @@ var testCmd = &cobra.Command{
 
 		fmt.Println("\n==> Step 2: Rolling back all migrations (DOWN)")
 		if err := m.RunDown(ctx, 0); err != nil {
-			fmt.Println("\n[!] Test failed during Step 2. Attempting auto-repair for temporary test database (rollback)...")
+			fmt.Println("\n[!] Test failed during Step 2. Attempting auto-repair...")
 			_ = m.Repair(ctx)
 			return err
 		}
@@ -223,15 +210,83 @@ var testCmd = &cobra.Command{
 
 		fmt.Println("\n==> Step 3: Re-applying all migrations (UP)")
 		if err := m.RunUp(ctx, 0); err != nil {
-			fmt.Println("\n[!] Test failed during Step 3. Attempting auto-repair for temporary test database (rollback)...")
+			fmt.Println("\n[!] Test failed during Step 3. Attempting auto-repair...")
 			_ = m.Repair(ctx)
 			return err
 		}
 		fmt.Println("      Step 3 OK")
 
-		fmt.Printf("\n  Integrity test PASSED for %s (using temporary DB %s)\n", originalDB, tempDBName)
+		fmt.Printf("\n  Integrity test PASSED (using %s)\n", label)
 		return nil
 	},
+}
+
+func setupPostgresTestDB(ctx context.Context) (database.DB, string, func(), error) {
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	letters := []rune("abcdefghijklmnopqrstuvwxyz")
+	b := make([]rune, 6)
+	for i := range b {
+		b[i] = letters[rng.Intn(len(letters))]
+	}
+	tempDBName := fmt.Sprintf("mig_test_%s_%s", time.Now().Format("200601021504"), string(b))
+
+	poolConfig, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	originalDB := poolConfig.ConnConfig.Database
+
+	adminConfig := poolConfig.ConnConfig.Copy()
+	adminConfig.Database = "postgres"
+
+	fmt.Printf("==> Creating temporary test database: %s\n", tempDBName)
+	if err := database.CreateDatabase(ctx, adminConfig, tempDBName); err != nil {
+		return nil, "", nil, fmt.Errorf("failed to create test database: %w", err)
+	}
+
+	testPoolConfig, _ := pgxpool.ParseConfig(dbURL)
+	testPoolConfig.ConnConfig.Database = tempDBName
+
+	db, err := database.NewPostgresDBFromConfig(ctx, testPoolConfig)
+	if err != nil {
+		_ = database.DropDatabase(ctx, adminConfig, tempDBName)
+		return nil, "", nil, err
+	}
+
+	cleanup := func() {
+		fmt.Printf("\n==> Cleaning up...\n")
+		fmt.Printf("==> Dropping temporary test database: %s\n", tempDBName)
+		if err := database.DropDatabase(ctx, adminConfig, tempDBName); err != nil {
+			fmt.Printf("Warning: failed to drop test database: %v\n", err)
+		}
+	}
+
+	label := fmt.Sprintf("%s (temp DB: %s)", originalDB, tempDBName)
+	return db, label, cleanup, nil
+}
+
+func setupSQLiteTestDB(ctx context.Context) (database.DB, string, func(), error) {
+	tmpFile, err := os.CreateTemp("", "mig_test_*.sqlite")
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("failed to create temp sqlite file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+
+	db, err := database.NewSQLiteDB(ctx, tmpPath)
+	if err != nil {
+		os.Remove(tmpPath)
+		return nil, "", nil, err
+	}
+
+	cleanup := func() {
+		fmt.Printf("\n==> Cleaning up temporary SQLite file: %s\n", tmpPath)
+		if err := os.Remove(tmpPath); err != nil {
+			fmt.Printf("Warning: failed to remove temp sqlite file: %v\n", err)
+		}
+	}
+
+	return db, fmt.Sprintf("SQLite temp file: %s", tmpPath), cleanup, nil
 }
 
 func Execute() {

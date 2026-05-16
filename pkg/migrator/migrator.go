@@ -9,8 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/mystaline/migration-tool/pkg/database"
 )
 
@@ -22,11 +20,11 @@ type Migration struct {
 }
 
 type Migrator struct {
-	DB  *database.PostgresDB
+	DB  database.DB
 	Dir string
 }
 
-func NewMigrator(db *database.PostgresDB, dir string) *Migrator {
+func NewMigrator(db database.DB, dir string) *Migrator {
 	return &Migrator{
 		DB:  db,
 		Dir: dir,
@@ -41,12 +39,11 @@ func (m *Migrator) Init(ctx context.Context) error {
 			applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 	`
-	_, err := m.DB.Pool.Exec(ctx, query)
-	return err
+	return m.DB.Exec(ctx, query)
 }
 
 func (m *Migrator) GetAppliedMigrations(ctx context.Context) (map[string]bool, error) {
-	rows, err := m.DB.Pool.Query(ctx, "SELECT version FROM schema_migrations WHERE dirty = FALSE")
+	rows, err := m.DB.Query(ctx, "SELECT version FROM schema_migrations WHERE dirty = FALSE")
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +62,7 @@ func (m *Migrator) GetAppliedMigrations(ctx context.Context) (map[string]bool, e
 
 func (m *Migrator) CheckDirty(ctx context.Context) (bool, error) {
 	var dirty bool
-	err := m.DB.Pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE dirty = TRUE)").Scan(&dirty)
+	err := m.DB.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE dirty = TRUE)").Scan(&dirty)
 	return dirty, err
 }
 
@@ -195,7 +192,7 @@ func (m *Migrator) RunDown(ctx context.Context, steps int) error {
 
 		fmt.Printf("==> Rolling back migration %s: %s\n", mig.Version, mig.Name)
 
-		err := m.rollbackMigration(ctx, mig, allMigrations)
+		err := m.rollbackMigration(ctx, mig)
 		if err != nil {
 			return fmt.Errorf("failed to rollback migration %s: %w", mig.Version, err)
 		}
@@ -244,28 +241,20 @@ func (m *Migrator) GetStatus(ctx context.Context) ([]Status, error) {
 	return status, nil
 }
 
-func (m *Migrator) rollbackMigration(ctx context.Context, mig Migration, all []Migration) error {
+func (m *Migrator) rollbackMigration(ctx context.Context, mig Migration) error {
 	content, err := os.ReadFile(filepath.Join(m.Dir, mig.DownFile))
 	if err != nil {
 		return err
 	}
 
-	return m.DB.ExecTx(ctx, func(tx pgx.Tx) error {
-		// Set dirty
-		_, err := tx.Exec(ctx, "UPDATE schema_migrations SET dirty = TRUE WHERE version = $1", mig.Version)
-		if err != nil {
+	return m.DB.ExecTx(ctx, func(tx database.Tx) error {
+		if err := tx.Exec(ctx, "UPDATE schema_migrations SET dirty = TRUE WHERE version = $1", mig.Version); err != nil {
 			return err
 		}
-
-		// Run SQL
-		_, err = tx.Exec(ctx, string(content))
-		if err != nil {
-			return formatPgError(err)
+		if err := tx.Exec(ctx, string(content)); err != nil {
+			return err
 		}
-
-		// Delete record
-		_, err = tx.Exec(ctx, "DELETE FROM schema_migrations WHERE version = $1", mig.Version)
-		return err
+		return tx.Exec(ctx, "DELETE FROM schema_migrations WHERE version = $1", mig.Version)
 	})
 }
 
@@ -277,23 +266,20 @@ func (m *Migrator) applyMigration(ctx context.Context, mig Migration) error {
 
 	// 1. Mark as dirty BEFORE running the migration script.
 	// We do this in a separate call to ensure it persists even if the main script fails.
-	_, err = m.DB.Pool.Exec(ctx, "INSERT INTO schema_migrations (version, dirty) VALUES ($1, TRUE) ON CONFLICT (version) DO UPDATE SET dirty = TRUE", mig.Version)
+	err = m.DB.Exec(ctx, "INSERT INTO schema_migrations (version, dirty) VALUES ($1, TRUE) ON CONFLICT (version) DO UPDATE SET dirty = TRUE", mig.Version)
 	if err != nil {
 		return fmt.Errorf("failed to mark migration as dirty: %w", err)
 	}
 
 	// 2. Run the migration script in a transaction.
-	err = m.DB.ExecTx(ctx, func(tx pgx.Tx) error {
-		_, err = tx.Exec(ctx, string(content))
-		return formatPgError(err)
-	})
-	if err != nil {
+	if err = m.DB.ExecTx(ctx, func(tx database.Tx) error {
+		return tx.Exec(ctx, string(content))
+	}); err != nil {
 		return err
 	}
 
 	// 3. Mark as clean AFTER successful migration.
-	_, err = m.DB.Pool.Exec(ctx, "UPDATE schema_migrations SET dirty = FALSE WHERE version = $1", mig.Version)
-	if err != nil {
+	if err = m.DB.Exec(ctx, "UPDATE schema_migrations SET dirty = FALSE WHERE version = $1", mig.Version); err != nil {
 		return fmt.Errorf("failed to mark migration as clean: %w", err)
 	}
 
@@ -327,7 +313,7 @@ func (m *Migrator) Create(name string) error {
 
 func (m *Migrator) Repair(ctx context.Context) error {
 	var version string
-	err := m.DB.Pool.QueryRow(ctx, "SELECT version FROM schema_migrations WHERE dirty = TRUE").Scan(&version)
+	err := m.DB.QueryRow(ctx, "SELECT version FROM schema_migrations WHERE dirty = TRUE").Scan(&version)
 	if err != nil {
 		return fmt.Errorf("no dirty migration found to repair: %w", err)
 	}
@@ -353,44 +339,22 @@ func (m *Migrator) Repair(ctx context.Context) error {
 
 	fmt.Printf("==> Running rollback (down) for version %s to reach previous stable state...\n", version)
 
-	// Execute the rollback
 	content, err := os.ReadFile(filepath.Join(m.Dir, targetMig.DownFile))
 	if err != nil {
 		return err
 	}
 
-	err = m.DB.ExecTx(ctx, func(tx pgx.Tx) error {
-		_, err = tx.Exec(ctx, string(content))
-		return formatPgError(err)
+	err = m.DB.ExecTx(ctx, func(tx database.Tx) error {
+		return tx.Exec(ctx, string(content))
 	})
 	if err != nil {
 		return fmt.Errorf("failed to execute rollback for repair: %w", err)
 	}
 
-	// Remove the record from schema_migrations
-	_, err = m.DB.Pool.Exec(ctx, "DELETE FROM schema_migrations WHERE version = $1", version)
-	if err != nil {
+	if err = m.DB.Exec(ctx, "DELETE FROM schema_migrations WHERE version = $1", version); err != nil {
 		return fmt.Errorf("failed to clear dirty record after repair: %w", err)
 	}
 
 	fmt.Printf("Successfully repaired and rolled back to version before %s.\n", version)
 	return nil
-}
-
-func formatPgError(err error) error {
-	if pgErr, ok := err.(*pgconn.PgError); ok {
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("PostgreSQL Error: %s\n", pgErr.Message))
-		if pgErr.Detail != "" {
-			sb.WriteString(fmt.Sprintf("Detail: %s\n", pgErr.Detail))
-		}
-		if pgErr.Hint != "" {
-			sb.WriteString(fmt.Sprintf("Hint: %s\n", pgErr.Hint))
-		}
-		if pgErr.Line > 0 {
-			sb.WriteString(fmt.Sprintf("Line: %d\n", pgErr.Line))
-		}
-		return fmt.Errorf("\n%s", sb.String())
-	}
-	return err
 }
