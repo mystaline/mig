@@ -16,7 +16,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ vars.GHCR_OWNER || 'mystaline' }}/migration-tool
+  IMAGE_NAME: ${{ vars.GHCR_OWNER || 'mystaline' }}/mig
 
 jobs:
   build-and-push:
