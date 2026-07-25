@@ -10,8 +10,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
-	"github.com/mystaline/migration-tool/pkg/database"
-	"github.com/mystaline/migration-tool/pkg/migrator"
+	"github.com/mystaline/mig/pkg/database"
+	"github.com/mystaline/mig/pkg/migrator"
 	"github.com/spf13/cobra"
 )
 

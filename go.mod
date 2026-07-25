@@ -1,4 +1,4 @@
-module github.com/mystaline/migration-tool
+module github.com/mystaline/mig
 
 go 1.25.4
 

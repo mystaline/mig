@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mystaline/migration-tool/pkg/database"
+	"github.com/mystaline/mig/pkg/database"
 )
 
 type Migration struct {

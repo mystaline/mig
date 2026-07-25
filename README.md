@@ -14,7 +14,7 @@ Follow this flow to install and run your first migration in 2 minutes.
 **Option 1: Using Make (Recommended)**
 
 ```bash
-git clone github.com/mystaline/migration-tool
+git clone github.com/mystaline/mig
 cd migration-tool
 make install
 ```
@@ -22,7 +22,7 @@ make install
 **Option 2: Manual Installation**
 
 ```bash
-git clone github.com/mystaline/migration-tool
+git clone github.com/mystaline/mig
 cd migration-tool
 go build -o mig ./cmd/main.go
 sudo mv mig /usr/local/bin/
