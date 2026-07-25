@@ -30,6 +30,13 @@ func (r *sqliteRows) Next() bool             { return r.rows.Next() }
 func (r *sqliteRows) Scan(dest ...any) error { return r.rows.Scan(dest...) }
 func (r *sqliteRows) Close()                 { r.rows.Close() }
 
+// NewSQLiteDBFromDB wraps an existing *sql.DB connection in a SQLiteDB
+// adapter, enabling use of the migrator with an already-open database
+// (the common case when embedding the migrator as a library).
+func NewSQLiteDBFromDB(db *sql.DB) *SQLiteDB {
+	return &SQLiteDB{db: db}
+}
+
 // NewSQLiteDB opens a SQLite database at the given file path.
 // The path can be a file path or ":memory:" for an in-memory database.
 func NewSQLiteDB(_ context.Context, path string) (*SQLiteDB, error) {

@@ -129,7 +129,7 @@ func CreateDatabase(ctx context.Context, config *pgx.ConnConfig, dbName string) 
 	}
 	defer conn.Close(ctx)
 
-	_, err = conn.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s", dbName))
+	_, err = conn.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s TEMPLATE template0", dbName))
 	return err
 }
 

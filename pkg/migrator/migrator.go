@@ -3,6 +3,7 @@ package migrator
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,8 +21,10 @@ type Migration struct {
 }
 
 type Migrator struct {
-	DB  database.DB
-	Dir string
+	DB    database.DB
+	Dir   string
+	Quiet bool  // when true, suppresses progress output (for library mode over MCP stdio)
+	fsys  fs.FS // optional; when set, reads migrations from fsys instead of disk
 }
 
 func NewMigrator(db database.DB, dir string) *Migrator {
@@ -29,6 +32,24 @@ func NewMigrator(db database.DB, dir string) *Migrator {
 		DB:  db,
 		Dir: dir,
 	}
+}
+
+// NewMigratorFromFS creates a Migrator that reads migration files from an
+// fs.FS (e.g. embed.FS) instead of the OS filesystem. The dir parameter is
+// the path within the fs.FS to the migration files. DB must be set via
+// SetDB or the Migrator.DB field before calling RunUp/RunDown.
+func NewMigratorFromFS(fsys fs.FS, dir string) *Migrator {
+	return &Migrator{
+		fsys: fsys,
+		Dir:  dir,
+	}
+}
+
+// SetDB sets the database connection on the Migrator. Separated from
+// NewMigratorFromFS because the DB may not be available at construction time
+// (e.g. when using embed.FS in a library that opens the DB later).
+func (m *Migrator) SetDB(db database.DB) {
+	m.DB = db
 }
 
 func (m *Migrator) Init(ctx context.Context) error {
@@ -67,13 +88,20 @@ func (m *Migrator) CheckDirty(ctx context.Context) (bool, error) {
 }
 
 func (m *Migrator) ListMigrations() ([]Migration, error) {
-	files, err := os.ReadDir(m.Dir)
+	var entries []fs.DirEntry
+	var err error
+
+	if m.fsys != nil {
+		entries, err = fs.ReadDir(m.fsys, m.Dir)
+	} else {
+		entries, err = os.ReadDir(m.Dir)
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	migrationsMap := make(map[string]*Migration)
-	for _, f := range files {
+	for _, f := range entries {
 		if f.IsDir() {
 			continue
 		}
@@ -137,14 +165,18 @@ func (m *Migrator) RunUp(ctx context.Context, steps int) error {
 			continue
 		}
 
-		fmt.Printf("==> Applying migration %s: %s\n", mig.Version, mig.Name)
+		if !m.Quiet {
+			fmt.Printf("==> Applying migration %s: %s\n", mig.Version, mig.Name)
+		}
 
 		err := m.applyMigration(ctx, mig)
 		if err != nil {
 			return fmt.Errorf("failed to apply migration %s: %w", mig.Version, err)
 		}
 
-		fmt.Printf("      Applied %s\n", mig.Version)
+		if !m.Quiet {
+			fmt.Printf("      Applied %s\n", mig.Version)
+		}
 		count++
 		if steps > 0 && count >= steps {
 			break
@@ -152,9 +184,13 @@ func (m *Migrator) RunUp(ctx context.Context, steps int) error {
 	}
 
 	if count == 0 {
-		fmt.Println("No pending migrations found.")
+		if !m.Quiet {
+			fmt.Println("No pending migrations found.")
+		}
 	} else {
-		fmt.Printf("Successfully applied %d migrations.\n", count)
+		if !m.Quiet {
+			fmt.Printf("Successfully applied %d migrations.\n", count)
+		}
 	}
 
 	return nil
@@ -190,14 +226,18 @@ func (m *Migrator) RunDown(ctx context.Context, steps int) error {
 			continue
 		}
 
-		fmt.Printf("==> Rolling back migration %s: %s\n", mig.Version, mig.Name)
+		if !m.Quiet {
+			fmt.Printf("==> Rolling back migration %s: %s\n", mig.Version, mig.Name)
+		}
 
 		err := m.rollbackMigration(ctx, mig)
 		if err != nil {
 			return fmt.Errorf("failed to rollback migration %s: %w", mig.Version, err)
 		}
 
-		fmt.Printf("      Rolled back %s\n", mig.Version)
+		if !m.Quiet {
+			fmt.Printf("      Rolled back %s\n", mig.Version)
+		}
 		count++
 		if steps > 0 && count >= steps {
 			break
@@ -205,9 +245,13 @@ func (m *Migrator) RunDown(ctx context.Context, steps int) error {
 	}
 
 	if count == 0 {
-		fmt.Println("No migrations to rollback.")
+		if !m.Quiet {
+			fmt.Println("No migrations to rollback.")
+		}
 	} else {
-		fmt.Printf("Successfully rolled back %d migrations.\n", count)
+		if !m.Quiet {
+			fmt.Printf("Successfully rolled back %d migrations.\n", count)
+		}
 	}
 
 	return nil
@@ -242,7 +286,7 @@ func (m *Migrator) GetStatus(ctx context.Context) ([]Status, error) {
 }
 
 func (m *Migrator) rollbackMigration(ctx context.Context, mig Migration) error {
-	content, err := os.ReadFile(filepath.Join(m.Dir, mig.DownFile))
+	content, err := m.readFile(mig.DownFile)
 	if err != nil {
 		return err
 	}
@@ -259,14 +303,18 @@ func (m *Migrator) rollbackMigration(ctx context.Context, mig Migration) error {
 }
 
 func (m *Migrator) applyMigration(ctx context.Context, mig Migration) error {
-	content, err := os.ReadFile(filepath.Join(m.Dir, mig.UpFile))
+	content, err := m.readFile(mig.UpFile)
 	if err != nil {
 		return err
 	}
 
 	// 1. Mark as dirty BEFORE running the migration script.
 	// We do this in a separate call to ensure it persists even if the main script fails.
-	err = m.DB.Exec(ctx, "INSERT INTO schema_migrations (version, dirty) VALUES ($1, TRUE) ON CONFLICT (version) DO UPDATE SET dirty = TRUE", mig.Version)
+	err = m.DB.Exec(
+		ctx,
+		"INSERT INTO schema_migrations (version, dirty) VALUES ($1, TRUE) ON CONFLICT (version) DO UPDATE SET dirty = TRUE",
+		mig.Version,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to mark migration as dirty: %w", err)
 	}
@@ -286,7 +334,20 @@ func (m *Migrator) applyMigration(ctx context.Context, mig Migration) error {
 	return nil
 }
 
+// readFile reads a migration file from fsys (if set) or from disk.
+func (m *Migrator) readFile(name string) ([]byte, error) {
+	if m.fsys != nil {
+		return fs.ReadFile(m.fsys, m.Dir+"/"+name)
+	}
+	return os.ReadFile(filepath.Join(m.Dir, name))
+}
+
 func (m *Migrator) Create(name string) error {
+	// Create only works with OS filesystem, not embed.FS.
+	if m.fsys != nil {
+		return fmt.Errorf("cannot create migration files on an embed.FS")
+	}
+
 	timestamp := time.Now().Format("20060102150405")
 	safeName := strings.ReplaceAll(strings.ToLower(name), " ", "_")
 
@@ -339,7 +400,7 @@ func (m *Migrator) Repair(ctx context.Context) error {
 
 	fmt.Printf("==> Running rollback (down) for version %s to reach previous stable state...\n", version)
 
-	content, err := os.ReadFile(filepath.Join(m.Dir, targetMig.DownFile))
+	content, err := m.readFile(targetMig.DownFile)
 	if err != nil {
 		return err
 	}
