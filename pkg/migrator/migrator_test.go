@@ -69,3 +69,54 @@ func TestExpandEnv(t *testing.T) {
 		t.Error("expected error for unset variable, got nil")
 	}
 }
+
+func TestExpandEnvIgnoresComments(t *testing.T) {
+	t.Setenv("MIG_TEST_PW", "s3cret")
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{{
+		// A comment documenting the syntax must not be treated as a real
+		// reference, even though no variable named VAR exists.
+		name: "line comment is left alone",
+		in:   "-- mig expands ${VAR} at run time\nPASSWORD '${MIG_TEST_PW}';",
+		want: "-- mig expands ${VAR} at run time\nPASSWORD 's3cret';",
+	}, {
+		name: "block comment is left alone",
+		in:   "/* see ${VAR} */ PASSWORD '${MIG_TEST_PW}';",
+		want: "/* see ${VAR} */ PASSWORD 's3cret';",
+	}, {
+		name: "nested block comment is left alone",
+		in:   "/* a /* ${VAR} */ b */ PASSWORD '${MIG_TEST_PW}';",
+		want: "/* a /* ${VAR} */ b */ PASSWORD 's3cret';",
+	}, {
+		// A literal '--' must not be mistaken for a comment start; if it were,
+		// the rest of the file would be skipped and nothing would expand.
+		name: "double dash inside a string is not a comment",
+		in:   "INSERT INTO t VALUES ('--'); PASSWORD '${MIG_TEST_PW}';",
+		want: "INSERT INTO t VALUES ('--'); PASSWORD 's3cret';",
+	}, {
+		name: "escaped quote does not end the string early",
+		in:   "INSERT INTO t VALUES ('it''s --'); PASSWORD '${MIG_TEST_PW}';",
+		want: "INSERT INTO t VALUES ('it''s --'); PASSWORD 's3cret';",
+	}}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := expandEnv([]byte(c.in), "test.sql")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if string(got) != c.want {
+				t.Errorf("got  %q\nwant %q", got, c.want)
+			}
+		})
+	}
+
+	// An unset variable in real SQL must still fail, even with a comment present.
+	if _, err := expandEnv([]byte("-- ${VAR}\nPASSWORD '${MIG_TEST_UNSET}';"), "test.sql"); err == nil {
+		t.Error("expected error for unset variable outside comment, got nil")
+	}
+}

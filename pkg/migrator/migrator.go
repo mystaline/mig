@@ -340,24 +340,101 @@ func (m *Migrator) applyMigration(ctx context.Context, mig Migration) error {
 // dollar quoting) and $1 (bind placeholders) must pass through verbatim.
 var envRefPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
+// commentSpans returns the byte ranges of SQL comments in content: -- to
+// end-of-line and /* */ (nestable, per the SQL standard). Ranges inside single
+// quoted strings are not comments, so quotes are tracked too — otherwise a
+// literal like '--' would blind the scanner to the rest of the file.
+func commentSpans(content []byte) [][2]int {
+	var spans [][2]int
+	for i := 0; i < len(content); {
+		switch {
+		case content[i] == '\'':
+			// Skip the string literal, honouring '' as an escaped quote.
+			i++
+			for i < len(content) {
+				if content[i] == '\'' {
+					if i+1 < len(content) && content[i+1] == '\'' {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+		case content[i] == '-' && i+1 < len(content) && content[i+1] == '-':
+			start := i
+			for i < len(content) && content[i] != '\n' {
+				i++
+			}
+			spans = append(spans, [2]int{start, i})
+		case content[i] == '/' && i+1 < len(content) && content[i+1] == '*':
+			start, depth := i, 0
+			for i < len(content) {
+				if content[i] == '/' && i+1 < len(content) && content[i+1] == '*' {
+					depth++
+					i += 2
+					continue
+				}
+				if content[i] == '*' && i+1 < len(content) && content[i+1] == '/' {
+					depth--
+					i += 2
+					if depth == 0 {
+						break
+					}
+					continue
+				}
+				i++
+			}
+			spans = append(spans, [2]int{start, i})
+		default:
+			i++
+		}
+	}
+	return spans
+}
+
 // expandEnv substitutes ${VAR} references with their environment values.
 // A reference to an unset variable is an error rather than an empty string:
 // silently expanding to "" would happily create a role with a blank password.
+//
+// References inside SQL comments are left alone, so a migration can document
+// the ${VAR} syntax in a comment without that mention being resolved as a real
+// reference (and failing the whole migration when no such variable is set).
 func expandEnv(content []byte, name string) ([]byte, error) {
-	var missing []string
-	out := envRefPattern.ReplaceAllFunc(content, func(match []byte) []byte {
-		key := string(envRefPattern.FindSubmatch(match)[1])
+	comments := commentSpans(content)
+	inComment := func(pos int) bool {
+		for _, s := range comments {
+			if pos >= s[0] && pos < s[1] {
+				return true
+			}
+		}
+		return false
+	}
+
+	var (
+		missing []string
+		out     []byte
+		last    int
+	)
+	for _, loc := range envRefPattern.FindAllSubmatchIndex(content, -1) {
+		if inComment(loc[0]) {
+			continue
+		}
+		key := string(content[loc[2]:loc[3]])
 		val, ok := os.LookupEnv(key)
 		if !ok {
 			missing = append(missing, key)
-			return match
+			continue
 		}
-		return []byte(val)
-	})
+		out = append(out, content[last:loc[0]]...)
+		out = append(out, val...)
+		last = loc[1]
+	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("migration %s references unset environment variable(s): %s", name, strings.Join(missing, ", "))
 	}
-	return out, nil
+	return append(out, content[last:]...), nil
 }
 
 // readFile reads a migration file from fsys (if set) or from disk, expanding
