@@ -49,3 +49,23 @@ func TestListMigrationsSorting(t *testing.T) {
 		}
 	}
 }
+
+func TestExpandEnv(t *testing.T) {
+	t.Setenv("MIG_TEST_PW", "s3cret")
+
+	// SQL dollar syntax must survive: $$ dollar-quoting and $1 placeholders.
+	in := []byte("DO $$ BEGIN CREATE ROLE r PASSWORD '${MIG_TEST_PW}'; END $$;\nDELETE FROM t WHERE v = $1;")
+	got, err := expandEnv(in, "test.sql")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "DO $$ BEGIN CREATE ROLE r PASSWORD 's3cret'; END $$;\nDELETE FROM t WHERE v = $1;"
+	if string(got) != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+
+	// Unset variable must fail loudly, not expand to "".
+	if _, err := expandEnv([]byte("PASSWORD '${MIG_TEST_UNSET}'"), "test.sql"); err == nil {
+		t.Error("expected error for unset variable, got nil")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -334,12 +335,47 @@ func (m *Migrator) applyMigration(ctx context.Context, mig Migration) error {
 	return nil
 }
 
-// readFile reads a migration file from fsys (if set) or from disk.
-func (m *Migrator) readFile(name string) ([]byte, error) {
-	if m.fsys != nil {
-		return fs.ReadFile(m.fsys, m.Dir+"/"+name)
+// envRefPattern matches only the braced ${VAR} form. Bare $VAR is deliberately
+// not supported so that SQL's own dollar syntax survives untouched: $$ (PL/pgSQL
+// dollar quoting) and $1 (bind placeholders) must pass through verbatim.
+var envRefPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// expandEnv substitutes ${VAR} references with their environment values.
+// A reference to an unset variable is an error rather than an empty string:
+// silently expanding to "" would happily create a role with a blank password.
+func expandEnv(content []byte, name string) ([]byte, error) {
+	var missing []string
+	out := envRefPattern.ReplaceAllFunc(content, func(match []byte) []byte {
+		key := string(envRefPattern.FindSubmatch(match)[1])
+		val, ok := os.LookupEnv(key)
+		if !ok {
+			missing = append(missing, key)
+			return match
+		}
+		return []byte(val)
+	})
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("migration %s references unset environment variable(s): %s", name, strings.Join(missing, ", "))
 	}
-	return os.ReadFile(filepath.Join(m.Dir, name))
+	return out, nil
+}
+
+// readFile reads a migration file from fsys (if set) or from disk, expanding
+// any ${VAR} environment references in the contents.
+func (m *Migrator) readFile(name string) ([]byte, error) {
+	var (
+		content []byte
+		err     error
+	)
+	if m.fsys != nil {
+		content, err = fs.ReadFile(m.fsys, m.Dir+"/"+name)
+	} else {
+		content, err = os.ReadFile(filepath.Join(m.Dir, name))
+	}
+	if err != nil {
+		return nil, err
+	}
+	return expandEnv(content, name)
 }
 
 func (m *Migrator) Create(name string) error {
